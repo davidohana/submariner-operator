@@ -25,6 +25,7 @@ import (
 	"github.com/pkg/errors"
 	submariner "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
 	"github.com/submariner-io/submariner-operator/internal/cli"
+	"github.com/submariner-io/submariner-operator/internal/constants"
 	"github.com/submariner-io/submariner-operator/internal/image"
 	"github.com/submariner-io/submariner-operator/internal/restconfig"
 	"github.com/submariner-io/submariner-operator/pkg/broker"
@@ -178,7 +179,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
 
 	operatorImage, err := image.ForOperator(jo.ImageVersion, jo.Repository, jo.ImageOverrideArr)
 	utils.ExitOnError("Error overriding Operator Image", err)
-	err = submarinerop.Ensure(status, clientConfig, OperatorNamespace, operatorImage, jo.OperatorDebug)
+	err = submarinerop.Ensure(status, clientConfig, constants.OperatorNamespace, operatorImage, jo.OperatorDebug)
 	status.EndWith(cli.CheckForError(err))
 	utils.ExitOnError("Error deploying the operator", err)
 
@@ -189,13 +190,13 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
 	utils.ExitOnError("Error creating SA for cluster", err)
 
 	// We need to connect to the broker in all cases
-	brokerSecret, err := brokersecret.Ensure(clientConfig, OperatorNamespace, populateBrokerSecret(subctlData))
+	brokerSecret, err := brokersecret.Ensure(clientConfig, constants.OperatorNamespace, populateBrokerSecret(subctlData))
 	utils.ExitOnError("Error creating broker secret for cluster", err)
 
 	if subctlData.IsConnectivityEnabled() {
 		status.Start("Deploying Submariner")
 
-		err = submarinercr.Ensure(clientConfig, OperatorNamespace, populateSubmarinerSpec(jo, subctlData, brokerSecret, netconfig))
+		err = submarinercr.Ensure(clientConfig, constants.OperatorNamespace, populateSubmarinerSpec(jo, subctlData, brokerSecret, netconfig))
 		if err == nil {
 			status.QueueSuccessMessage("Submariner is up and running")
 			status.EndWith(cli.Success)
@@ -207,7 +208,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
 		utils.ExitOnError("Error deploying Submariner", err)
 	} else if subctlData.IsServiceDiscoveryEnabled() {
 		status.Start("Deploying service discovery only")
-		err = servicediscoverycr.Ensure(clientConfig, OperatorNamespace, populateServiceDiscoverySpec(jo, subctlData, brokerSecret))
+		err = servicediscoverycr.Ensure(clientConfig, constants.OperatorNamespace, populateServiceDiscoverySpec(jo, subctlData, brokerSecret))
 		if err == nil {
 			status.QueueSuccessMessage("Service discovery is up and running")
 			status.EndWith(cli.Success)
@@ -296,7 +297,7 @@ func getNetworkDetails(config *rest.Config) *network.ClusterNetwork {
 	submarinerClient, err := submarinerclientset.NewForConfig(config)
 	utils.ExitOnError("Unable to get the Submariner client", err)
 
-	networkDetails, err := network.Discover(dynClient, clientSet, submarinerClient, OperatorNamespace)
+	networkDetails, err := network.Discover(dynClient, clientSet, submarinerClient, constants.OperatorNamespace)
 	if err != nil {
 		status.QueueWarningMessage(fmt.Sprintf("Error trying to discover network details: %s", err))
 	} else if networkDetails != nil {
@@ -434,7 +435,7 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 		ClusterID:                jo.ClusterID,
 		ServiceCIDR:              crServiceCIDR,
 		ClusterCIDR:              crClusterCIDR,
-		Namespace:                SubmarinerNamespace,
+		Namespace:                constants.SubmarinerNamespace,
 		CableDriver:              jo.CableDriver,
 		ServiceDiscoveryEnabled:  subctlData.IsServiceDiscoveryEnabled(),
 		ImageOverrides:           imageOverrides,
@@ -511,7 +512,7 @@ func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, b
 		BrokerK8sSecret:          brokerSecret.ObjectMeta.Name,
 		Debug:                    jo.SubmarinerDebug,
 		ClusterID:                jo.ClusterID,
-		Namespace:                SubmarinerNamespace,
+		Namespace:                constants.SubmarinerNamespace,
 		ImageOverrides:           imageOverrides,
 	}
 
