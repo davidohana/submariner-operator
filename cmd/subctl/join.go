@@ -38,10 +38,12 @@ var joinCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		err := checkArgumentPassed(args)
 		exit.OnError("Argument missing", err)
+
 		subctlData, err := datafile.NewFromFile(args[0])
 		exit.OnError("Error loading the broker information from the given file", err)
 		fmt.Printf("* %s says broker is at: %s\n", args[0], subctlData.BrokerURL)
-		err = join.SubmarinerCluster(subctlData, joinFlags)
+
+		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer)
 		exit.OnError("error joining cluster", err)
 	},
 }

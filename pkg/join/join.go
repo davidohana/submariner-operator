@@ -19,7 +19,9 @@ limitations under the License.
 package join
 
 import (
+	"context"
 	"encoding/base64"
+	goerrors "errors"
 	"fmt"
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/pkg/errors"
@@ -40,13 +42,18 @@ import (
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinerop"
 	"github.com/submariner-io/submariner-operator/pkg/version"
 	v1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Options struct {
@@ -81,11 +88,11 @@ type Options struct {
 
 var status = cli.NewStatus()
 
-func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
+func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer) error{
 	// Missing information
 	qs := []*survey.Question{}
 
-	determineClusterID(jo)
+	determineClusterID(jo, restConfigProducer)
 
 	if valid, err := isValidClusterID(jo.ClusterID); !valid {
 		fmt.Printf("Error: %s\n", err.Error())
@@ -133,8 +140,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
 
 	clientConfig, err := restConfigProducer.ClientConfig().ClientConfig()
 	utils.ExitOnError("Error connecting to the target cluster", err)
-
-	checkRequirements(clientConfig)
+	checkRequirements(jo, clientConfig)
 
 	if subctlData.IsConnectivityEnabled() && jo.LabelGateway {
 		err := handleNodeLabels(clientConfig)
@@ -222,8 +228,8 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options) error{
 	return nil
 }
 
-func checkRequirements(jo Options, clientConfig *rest.Config) {
-	_, failedRequirements, err := version.CheckRequirements(clientConfig)
+func checkRequirements(jo Options, config *rest.Config) {
+	_, failedRequirements, err := version.CheckRequirements(config)
 	// We display failed requirements even if an error occurred
 	if len(failedRequirements) > 0 {
 		fmt.Println("The target cluster fails to meet Submariner's requirements:")
@@ -241,7 +247,7 @@ func checkRequirements(jo Options, clientConfig *rest.Config) {
 	utils.ExitOnError("Unable to check requirements", err)
 }
 
-func determineClusterID(jo Options) {
+func determineClusterID(jo Options, restConfigProducer restconfig.Producer) {
 	if jo.ClusterID == "" {
 		clusterName, err := restConfigProducer.ClusterNameFromContext()
 		utils.ExitOnError("Error connecting to the target cluster", err)
@@ -451,7 +457,7 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 	}
 
 	if jo.CorednsCustomConfigMap != "" {
-		namespace, name := getCustomCoreDNSParams()
+		namespace, name := getCustomCoreDNSParams(jo)
 		submarinerSpec.CoreDNSCustomConfig = &submariner.CoreDNSCustomConfig{
 			ConfigMapName: name,
 			Namespace:     namespace,
@@ -551,4 +557,134 @@ func getCustomCoreDNSParams(jo Options) (namespace, name string) {
 	}
 
 	return namespace, name
+}
+
+func handleNodeLabels(config *rest.Config) error {
+	_, clientset, err := restconfig.Clients(config)
+	utils.ExitOnError("Unable to set the Kubernetes cluster connection up", err)
+	// List Submariner-labeled nodes
+	const submarinerGatewayLabel = "submariner.io/gateway"
+	const trueLabel = "true"
+
+	selector := labels.SelectorFromSet(map[string]string{submarinerGatewayLabel: trueLabel})
+
+	labeledNodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
+	if err != nil {
+		return errors.Wrap(err, "error listing Nodes")
+	}
+
+	if len(labeledNodes.Items) > 0 {
+		fmt.Printf("* There are %d labeled nodes in the cluster:\n", len(labeledNodes.Items))
+
+		for i := range labeledNodes.Items {
+			fmt.Printf("  - %s\n", labeledNodes.Items[i].GetName())
+		}
+	} else {
+		answer, err := askForGatewayNode(clientset)
+		if err != nil {
+			return err
+		}
+
+		if answer.Node == "" {
+			fmt.Printf("* No worker node found to label as the gateway\n")
+		} else {
+			err = addLabelsToNode(clientset, answer.Node, map[string]string{submarinerGatewayLabel: trueLabel})
+			utils.ExitOnError("Error labeling the gateway node", err)
+		}
+	}
+
+	return nil
+}
+
+func askForGatewayNode(clientset kubernetes.Interface) (struct{ Node string }, error) {
+	// List the worker nodes and select one
+	workerNodes, err := clientset.CoreV1().Nodes().List(
+		context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker"})
+	if err != nil {
+		return struct{ Node string }{}, errors.Wrap(err, "error listing Nodes")
+	}
+
+	if len(workerNodes.Items) == 0 {
+		// In some deployments (like KIND), worker nodes are not explicitly labelled. So list non-master nodes.
+		workerNodes, err = clientset.CoreV1().Nodes().List(
+			context.TODO(), metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/master"})
+		if err != nil {
+			return struct{ Node string }{}, errors.Wrap(err, "error listing Nodes")
+		}
+
+		if len(workerNodes.Items) == 0 {
+			return struct{ Node string }{}, nil
+		}
+	}
+
+	if len(workerNodes.Items) == 1 {
+		return struct{ Node string }{workerNodes.Items[0].GetName()}, nil
+	}
+
+	allNodeNames := []string{}
+	for i := range workerNodes.Items {
+		allNodeNames = append(allNodeNames, workerNodes.Items[i].GetName())
+	}
+
+	qs := []*survey.Question{
+		{
+			Name: "node",
+			Prompt: &survey.Select{
+				Message: "Which node should be used as the gateway?",
+				Options: allNodeNames,
+			},
+		},
+	}
+
+	answers := struct {
+		Node string
+	}{}
+
+	err = survey.Ask(qs, &answers)
+	if err != nil {
+		return struct{ Node string }{}, err // nolint:wrapcheck // No need to wrap here
+	}
+
+	return answers, nil
+}
+
+// this function was sourced from:
+// https://github.com/kubernetes/kubernetes/blob/a3ccea9d8743f2ff82e41b6c2af6dc2c41dc7b10/test/utils/density_utils.go#L36
+func addLabelsToNode(c kubernetes.Interface, nodeName string, labelsToAdd map[string]string) error {
+	tokens := make([]string, 0, len(labelsToAdd))
+	for k, v := range labelsToAdd {
+		tokens = append(tokens, fmt.Sprintf("%q:%q", k, v))
+	}
+
+	labelString := "{" + strings.Join(tokens, ",") + "}"
+	patch := fmt.Sprintf(`{"metadata":{"labels":%v}}`, labelString)
+
+	// retry is necessary because nodes get updated every 10 seconds, and a patch can happen
+	// in the middle of an update
+
+	var lastErr error
+	err := wait.ExponentialBackoff(nodeLabelBackoff, func() (bool, error) {
+		_, lastErr = c.CoreV1().Nodes().Patch(context.TODO(), nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+		if lastErr != nil {
+			if !k8serrors.IsConflict(lastErr) {
+				return false, lastErr // nolint:wrapcheck // No need to wrap here
+			}
+			return false, nil
+		}
+
+		return true, nil
+	})
+
+	if goerrors.Is(err, wait.ErrWaitTimeout) {
+		return lastErr // nolint:wrapcheck // No need to wrap here
+	}
+
+	return err // nolint:wrapcheck // No need to wrap here
+}
+
+var nodeLabelBackoff wait.Backoff = wait.Backoff{
+	Steps:    10,
+	Duration: 1 * time.Second,
+	Factor:   1.2,
+	Jitter:   1,
 }
