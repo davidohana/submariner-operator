@@ -26,7 +26,6 @@ import (
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/pkg/errors"
 	submariner "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
-	"github.com/submariner-io/submariner-operator/internal/cli"
 	"github.com/submariner-io/submariner-operator/internal/constants"
 	"github.com/submariner-io/submariner-operator/internal/image"
 	"github.com/submariner-io/submariner-operator/internal/restconfig"
@@ -34,6 +33,7 @@ import (
 	submarinerclientset "github.com/submariner-io/submariner-operator/pkg/client/clientset/versioned"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
+	"github.com/submariner-io/submariner-operator/pkg/reporter"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/cmd/utils"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokersecret"
@@ -50,7 +50,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/retry"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -86,13 +85,15 @@ type Options struct {
 	CorednsCustomConfigMap        string
 }
 
-var status = cli.NewStatus()
-
-func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer) error{
+func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer, status reporter.Interface) error {
 	// Missing information
 	qs := []*survey.Question{}
 
-	determineClusterID(jo, restConfigProducer)
+	status.Start("Trying to join cluster %s", jo.ClusterID)
+	err := determineClusterID(jo, restConfigProducer)
+	if err != nil {
+		return status.Error(err, "Error determining cluster ID of the target cluster")
+	}
 
 	if valid, err := isValidClusterID(jo.ClusterID); !valid {
 		fmt.Printf("Error: %s\n", err.Error())
@@ -138,32 +139,56 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		}
 	}
 
+	err = isValidCustomCoreDNSConfig(jo)
+	if err != nil {
+		return status.Error(err, "error validating custom CoreDNS config")
+	}
+
 	clientConfig, err := restConfigProducer.ClientConfig().ClientConfig()
-	utils.ExitOnError("Error connecting to the target cluster", err)
-	checkRequirements(jo, clientConfig)
+	if err != nil {
+		return status.Error(err, "Error connecting to the target cluster")
+	}
+
+	err = checkRequirements(jo, clientConfig)
+	if err != nil {
+		return status.Error(err, "Error checking Submariner requirements")
+	}
 
 	if subctlData.IsConnectivityEnabled() && jo.LabelGateway {
 		err := handleNodeLabels(clientConfig)
-		utils.ExitOnError("Unable to set the gateway node up", err)
+		if err != nil {
+			return status.Error(err, "Unable to set the gateway node up")
+		}
 	}
+	status.End()
 
 	status.Start("Discovering network details")
+	networkDetails, err := getNetworkDetails(clientConfig, status)
+	if err != nil {
+		return status.Error(err, "Unable to discover network details")
+	}
 
-	networkDetails := getNetworkDetails(clientConfig)
+	serviceCIDR, serviceCIDRautoDetected, err := getServiceCIDR(jo.ServiceCIDR, networkDetails, status)
+	if err != nil {
+		return status.Error(err, "Error determining the service CIDR")
+	}
 
-	status.EndWith(cli.Success)
+	clusterCIDR, clusterCIDRautoDetected, err := getPodCIDR(jo.ClusterCIDR, networkDetails, status)
+	if err != nil {
+		return status.Error(err, "Error determining the pod CIDR")
+	}
+	status.End()
 
-	serviceCIDR, serviceCIDRautoDetected, err := getServiceCIDR(jo.ServiceCIDR, networkDetails)
-	utils.ExitOnError("Error determining the service CIDR", err)
-
-	clusterCIDR, clusterCIDRautoDetected, err := getPodCIDR(jo.ClusterCIDR, networkDetails)
-	utils.ExitOnError("Error determining the pod CIDR", err)
-
+	status.Start("Gathering relevant information from Broker")
 	brokerAdminConfig, err := subctlData.GetBrokerAdministratorConfig()
-	utils.ExitOnError("Error retrieving broker admin config", err)
+	if err != nil {
+		return status.Error(err, "Error retrieving broker admin config")
+	}
 
 	brokerAdminClientset, err := kubernetes.NewForConfig(brokerAdminConfig)
-	utils.ExitOnError("Error retrieving broker admin connection", err)
+	if err != nil {
+		return status.Error(err, "Error retrieving broker admin connection")
+	}
 
 	brokerNamespace := string(subctlData.ClientToken.Data["namespace"])
 	netconfig := globalnet.Config{
@@ -177,58 +202,75 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 	}
 
 	if jo.GlobalnetEnabled {
-		err = AllocateAndUpdateGlobalCIDRConfigMap(jo, brokerAdminClientset, brokerNamespace, &netconfig)
-		utils.ExitOnError("Error Discovering multi cluster details", err)
+		err = AllocateAndUpdateGlobalCIDRConfigMap(jo, brokerAdminClientset, brokerNamespace, &netconfig, status)
+		if err != nil {
+			return status.Error(err, "Error Discovering multi cluster details")
+		}
 	}
+	status.End()
 
 	status.Start("Deploying the Submariner operator")
 
 	operatorImage, err := image.ForOperator(jo.ImageVersion, jo.Repository, jo.ImageOverrideArr)
-	utils.ExitOnError("Error overriding Operator Image", err)
+	if err != nil {
+		return status.Error(err, "Error overriding Operator Image")
+	}
+
 	err = submarinerop.Ensure(status, clientConfig, constants.OperatorNamespace, operatorImage, jo.OperatorDebug)
-	status.EndWith(cli.CheckForError(err))
-	utils.ExitOnError("Error deploying the operator", err)
+	if err != nil {
+		return status.Error(err, "Error deploying the operator")
+	}
+	status.End()
 
 	status.Start("Creating SA for cluster")
 
 	subctlData.ClientToken, err = broker.CreateSAForCluster(brokerAdminClientset, jo.ClusterID, brokerNamespace)
-	status.EndWith(cli.CheckForError(err))
-	utils.ExitOnError("Error creating SA for cluster", err)
+	if err != nil {
+		return status.Error(err, "Error creating SA for cluster")
+	}
+	status.End()
 
+	status.Start("Connecting to Broker")
 	// We need to connect to the broker in all cases
 	brokerSecret, err := brokersecret.Ensure(clientConfig, constants.OperatorNamespace, populateBrokerSecret(subctlData))
-	utils.ExitOnError("Error creating broker secret for cluster", err)
+	if err != nil {
+		return status.Error(err, "Error creating broker secret for cluster")
+	}
+	status.End()
 
 	if subctlData.IsConnectivityEnabled() {
 		status.Start("Deploying Submariner")
 
-		err = submarinercr.Ensure(clientConfig, constants.OperatorNamespace, populateSubmarinerSpec(jo, subctlData, brokerSecret, netconfig))
+		submarinerSpec, err := populateSubmarinerSpec(jo, subctlData, brokerSecret, netconfig)
+		if err != nil {
+			return status.Error(err, "Error populating Submariner spec")
+		}
+		err = submarinercr.Ensure(clientConfig, constants.OperatorNamespace, submarinerSpec)
 		if err == nil {
-			status.QueueSuccessMessage("Submariner is up and running")
-			status.EndWith(cli.Success)
+			status.Success("Submariner is up and running")
+			status.End()
 		} else {
-			status.QueueFailureMessage("Submariner deployment failed")
-			status.EndWith(cli.Failure)
+			return status.Error(err, "Submariner deployment failed")
 		}
 
-		utils.ExitOnError("Error deploying Submariner", err)
 	} else if subctlData.IsServiceDiscoveryEnabled() {
 		status.Start("Deploying service discovery only")
-		err = servicediscoverycr.Ensure(clientConfig, constants.OperatorNamespace, populateServiceDiscoverySpec(jo, subctlData, brokerSecret))
-		if err == nil {
-			status.QueueSuccessMessage("Service discovery is up and running")
-			status.EndWith(cli.Success)
-		} else {
-			status.QueueFailureMessage("Service discovery deployment failed")
-			status.EndWith(cli.Failure)
+		serviceDiscoverySpec, err := populateServiceDiscoverySpec(jo, subctlData, brokerSecret)
+		if err != nil {
+			return status.Error(err, "Error populating service discovery spec")
 		}
-		utils.ExitOnError("Error deploying service discovery", err)
+		err = servicediscoverycr.Ensure(clientConfig, constants.OperatorNamespace, serviceDiscoverySpec)
+		if err == nil {
+			status.Success("Service discovery is up and running")
+		} else {
+			return status.Error(err, "Service discovery deployment failed")
+		}
 	}
 
 	return nil
 }
 
-func checkRequirements(jo Options, config *rest.Config) {
+func checkRequirements(jo Options, config *rest.Config) error {
 	_, failedRequirements, err := version.CheckRequirements(config)
 	// We display failed requirements even if an error occurred
 	if len(failedRequirements) > 0 {
@@ -239,27 +281,32 @@ func checkRequirements(jo Options, config *rest.Config) {
 		}
 
 		if !jo.IgnoreRequirements {
-			utils.ExitOnError("Unable to check all requirements", err)
-			os.Exit(1)
+			return err
 		}
 	}
 
-	utils.ExitOnError("Unable to check requirements", err)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-func determineClusterID(jo Options, restConfigProducer restconfig.Producer) {
+func determineClusterID(jo Options, restConfigProducer restconfig.Producer) error {
 	if jo.ClusterID == "" {
 		clusterName, err := restConfigProducer.ClusterNameFromContext()
-		utils.ExitOnError("Error connecting to the target cluster", err)
+		if err != nil {
+			return err
+		}
 
 		if clusterName != nil {
 			jo.ClusterID = *clusterName
 		}
 	}
+	return nil
 }
 
 func AllocateAndUpdateGlobalCIDRConfigMap(jo Options, brokerAdminClientset *kubernetes.Clientset, brokerNamespace string,
-	netconfig *globalnet.Config) error {
+	netconfig *globalnet.Config, status reporter.Interface) error {
 	status.Start("Discovering multi cluster details")
 
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -296,27 +343,31 @@ func AllocateAndUpdateGlobalCIDRConfigMap(jo Options, brokerAdminClientset *kube
 	return retryErr // nolint:wrapcheck // No need to wrap here
 }
 
-func getNetworkDetails(config *rest.Config) *network.ClusterNetwork {
+func getNetworkDetails(config *rest.Config, status reporter.Interface) (*network.ClusterNetwork, error) {
 	dynClient, clientSet, err := restconfig.Clients(config)
-	utils.ExitOnError("Unable to set the Kubernetes cluster connection up", err)
+	if err != nil {
+		return nil, errors.Wrap(err, "Unable to set the Kubernetes cluster connection up")
+	}
 
 	submarinerClient, err := submarinerclientset.NewForConfig(config)
-	utils.ExitOnError("Unable to get the Submariner client", err)
+	if err != nil {
+		return nil, errors.Wrap(err, "Unable to get the Submariner client")
+	}
 
 	networkDetails, err := network.Discover(dynClient, clientSet, submarinerClient, constants.OperatorNamespace)
 	if err != nil {
-		status.QueueWarningMessage(fmt.Sprintf("Error trying to discover network details: %s", err))
+		status.Warning(fmt.Sprintf("Error trying to discover network details: %s", err))
 	} else if networkDetails != nil {
 		networkDetails.Show()
 	}
 
-	return networkDetails
+	return networkDetails, nil
 }
 
-func getPodCIDR(clusterCIDR string, nd *network.ClusterNetwork) (cidrType string, autodetected bool, err error) {
+func getPodCIDR(clusterCIDR string, nd *network.ClusterNetwork, status reporter.Interface) (cidrType string, autodetected bool, err error) {
 	if clusterCIDR != "" {
 		if nd != nil && len(nd.PodCIDRs) > 0 && nd.PodCIDRs[0] != clusterCIDR {
-			status.QueueWarningMessage(fmt.Sprintf("Your provided cluster CIDR for the pods (%s) does not match discovered (%s)\n",
+			status.Warning(fmt.Sprintf("Your provided cluster CIDR for the pods (%s) does not match discovered (%s)\n",
 				clusterCIDR, nd.PodCIDRs[0]))
 		}
 
@@ -329,10 +380,10 @@ func getPodCIDR(clusterCIDR string, nd *network.ClusterNetwork) (cidrType string
 	}
 }
 
-func getServiceCIDR(serviceCIDR string, nd *network.ClusterNetwork) (cidrType string, autodetected bool, err error) {
+func getServiceCIDR(serviceCIDR string, nd *network.ClusterNetwork, status reporter.Interface) (cidrType string, autodetected bool, err error) {
 	if serviceCIDR != "" {
 		if nd != nil && len(nd.ServiceCIDRs) > 0 && nd.ServiceCIDRs[0] != serviceCIDR {
-			status.QueueWarningMessage(fmt.Sprintf("Your provided service CIDR (%s) does not match discovered (%s)\n",
+			status.Warning(fmt.Sprintf("Your provided service CIDR (%s) does not match discovered (%s)\n",
 				serviceCIDR, nd.ServiceCIDRs[0]))
 		}
 
@@ -392,7 +443,7 @@ func populateBrokerSecret(subctlData *datafile.SubctlData) *v1.Secret {
 }
 
 func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerSecret *v1.Secret,
-	netconfig globalnet.Config) *submariner.SubmarinerSpec {
+	netconfig globalnet.Config) (*submariner.SubmarinerSpec, error) {
 	brokerURL := subctlData.BrokerURL
 	if idx := strings.Index(brokerURL, "://"); idx >= 0 {
 		// Submariner doesn't work with a schema prefix
@@ -416,7 +467,9 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 	}
 
 	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
-	utils.ExitOnError("Error overriding Operator image", err)
+	if err != nil {
+		return nil, fmt.Errorf("error overriding Operator image %s", err)
+	}
 
 	// For backwards compatibility, the connection information is populated through the secret and individual components
 	// TODO skitt This will be removed in the release following 0.12
@@ -468,7 +521,7 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 		submarinerSpec.CustomDomains = jo.CustomDomains
 	}
 
-	return submarinerSpec
+	return submarinerSpec, nil
 }
 
 func getImageVersion(jo Options) string {
@@ -498,7 +551,7 @@ func removeSchemaPrefix(brokerURL string) string {
 	return brokerURL
 }
 
-func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, brokerSecret *v1.Secret) *submariner.ServiceDiscoverySpec {
+func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, brokerSecret *v1.Secret) (*submariner.ServiceDiscoverySpec, error) {
 	brokerURL := removeSchemaPrefix(subctlData.BrokerURL)
 
 	if jo.CustomDomains == nil && subctlData.CustomDomains != nil {
@@ -506,7 +559,9 @@ func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, b
 	}
 
 	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
-	utils.ExitOnError("Error overriding Operator image", err)
+	if err != nil {
+		return nil, fmt.Errorf("error overriding Operator image %s", err)
+	}
 
 	serviceDiscoverySpec := submariner.ServiceDiscoverySpec{
 		Repository:               jo.Repository,
@@ -534,7 +589,7 @@ func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, b
 		serviceDiscoverySpec.CustomDomains = jo.CustomDomains
 	}
 
-	return &serviceDiscoverySpec
+	return &serviceDiscoverySpec, nil
 }
 
 func isValidCustomCoreDNSConfig(jo Options) error {
@@ -561,7 +616,9 @@ func getCustomCoreDNSParams(jo Options) (namespace, name string) {
 
 func handleNodeLabels(config *rest.Config) error {
 	_, clientset, err := restconfig.Clients(config)
-	utils.ExitOnError("Unable to set the Kubernetes cluster connection up", err)
+	if err != nil {
+		return errors.Wrap(err, "unable to set the Kubernetes cluster connection up")
+	}
 	// List Submariner-labeled nodes
 	const submarinerGatewayLabel = "submariner.io/gateway"
 	const trueLabel = "true"
@@ -589,7 +646,7 @@ func handleNodeLabels(config *rest.Config) error {
 			fmt.Printf("* No worker node found to label as the gateway\n")
 		} else {
 			err = addLabelsToNode(clientset, answer.Node, map[string]string{submarinerGatewayLabel: trueLabel})
-			utils.ExitOnError("Error labeling the gateway node", err)
+			return errors.Wrap(err, "Error labeling the gateway node")
 		}
 	}
 

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"github.com/spf13/cobra"
 	submariner "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
+	"github.com/submariner-io/submariner-operator/internal/cli"
 	"github.com/submariner-io/submariner-operator/internal/exit"
 	"github.com/submariner-io/submariner-operator/pkg/join"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
@@ -43,7 +44,7 @@ var joinCmd = &cobra.Command{
 		exit.OnError("Error loading the broker information from the given file", err)
 		fmt.Printf("* %s says broker is at: %s\n", args[0], subctlData.BrokerURL)
 
-		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer)
+		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer, cli.NewReporter())
 		exit.OnError("error joining cluster", err)
 	},
 }
