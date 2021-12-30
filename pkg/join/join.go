@@ -23,7 +23,6 @@ import (
 	"encoding/base64"
 	goerrors "errors"
 	"fmt"
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/pkg/errors"
 	submariner "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
 	"github.com/submariner-io/submariner-operator/internal/constants"
@@ -34,7 +33,6 @@ import (
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
-	"github.com/submariner-io/submariner-operator/pkg/subctl/cmd/utils"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokersecret"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/servicediscoverycr"
@@ -85,9 +83,7 @@ type Options struct {
 	CorednsCustomConfigMap        string
 }
 
-func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer, status reporter.Interface) error {
-	// Missing information
-	qs := []*survey.Question{}
+func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer, status reporter.Interface, gatewayNode struct{Node string}) error {
 
 	status.Start("Trying to join cluster %s", jo.ClusterID)
 	err := determineClusterID(jo, restConfigProducer)
@@ -95,48 +91,8 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		return status.Error(err, "Error determining cluster ID of the target cluster")
 	}
 
-	if valid, err := isValidClusterID(jo.ClusterID); !valid {
+	if valid, err := IsValidClusterID(jo.ClusterID); !valid {
 		fmt.Printf("Error: %s\n", err.Error())
-
-		qs = append(qs, &survey.Question{
-			Name:   "clusterID",
-			Prompt: &survey.Input{Message: "What is your cluster ID?"},
-			Validate: func(val interface{}) error {
-				str, ok := val.(string)
-				if !ok {
-					return nil
-				}
-				_, err := isValidClusterID(str)
-				return err
-			},
-		})
-	}
-
-	if jo.ColorCodes == "" {
-		qs = append(qs, &survey.Question{
-			Name:     "colorCodes",
-			Prompt:   &survey.Input{Message: "What color codes should be used (e.g. \"blue\")?"},
-			Validate: survey.Required,
-		})
-	}
-
-	if len(qs) > 0 {
-		answers := struct {
-			ClusterID  string
-			ColorCodes string
-		}{}
-
-		err := survey.Ask(qs, &answers)
-		// Most likely a programming error
-		utils.PanicOnError(err)
-
-		if len(answers.ClusterID) > 0 {
-			jo.ClusterID = answers.ClusterID
-		}
-
-		if len(answers.ColorCodes) > 0 {
-			jo.ColorCodes = answers.ColorCodes
-		}
 	}
 
 	err = isValidCustomCoreDNSConfig(jo)
@@ -155,7 +111,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 	}
 
 	if subctlData.IsConnectivityEnabled() && jo.LabelGateway {
-		err := handleNodeLabels(clientConfig)
+		err := handleNodeLabels(clientConfig, gatewayNode)
 		if err != nil {
 			return status.Error(err, "Unable to set the gateway node up")
 		}
@@ -375,8 +331,7 @@ func getPodCIDR(clusterCIDR string, nd *network.ClusterNetwork, status reporter.
 	} else if nd != nil && len(nd.PodCIDRs) > 0 {
 		return nd.PodCIDRs[0], true, nil
 	} else {
-		cidrType, err = askForCIDR("Pod")
-		return cidrType, false, err
+		return "", false, fmt.Errorf("could not determine cluster network")
 	}
 }
 
@@ -390,32 +345,11 @@ func getServiceCIDR(serviceCIDR string, nd *network.ClusterNetwork, status repor
 		return serviceCIDR, false, nil
 	} else if nd != nil && len(nd.ServiceCIDRs) > 0 {
 		return nd.ServiceCIDRs[0], true, nil
-	} else {
-		cidrType, err = askForCIDR("ClusterIP service")
-		return cidrType, false, err
 	}
+	return "", false, fmt.Errorf("could not determine cluster network")
 }
 
-func askForCIDR(name string) (string, error) {
-	qs := []*survey.Question{{
-		Name:     "cidr",
-		Prompt:   &survey.Input{Message: fmt.Sprintf("What's the %s CIDR for your cluster?", name)},
-		Validate: survey.Required,
-	}}
-
-	answers := struct {
-		Cidr string
-	}{}
-
-	err := survey.Ask(qs, &answers)
-	if err != nil {
-		return "", err // nolint:wrapcheck // No need to wrap here
-	}
-
-	return strings.TrimSpace(answers.Cidr), nil
-}
-
-func isValidClusterID(clusterID string) (bool, error) {
+func IsValidClusterID(clusterID string) (bool, error) {
 	// Make sure the clusterid is a valid DNS-1123 string
 	if match, _ := regexp.MatchString("^[a-z0-9][a-z0-9.-]*[a-z0-9]$", clusterID); !match {
 		return false, fmt.Errorf("cluster IDs must be valid DNS-1123 names, with only lowercase alphanumerics,\n"+
@@ -614,20 +548,69 @@ func getCustomCoreDNSParams(jo Options) (namespace, name string) {
 	return namespace, name
 }
 
-func handleNodeLabels(config *rest.Config) error {
+
+// labels the specified worker node as a gateway node
+func handleNodeLabels(config *rest.Config, gatewayNode struct{Node string}) error {
 	_, clientset, err := restconfig.Clients(config)
 	if err != nil {
 		return errors.Wrap(err, "unable to set the Kubernetes cluster connection up")
 	}
-	// List Submariner-labeled nodes
-	const submarinerGatewayLabel = "submariner.io/gateway"
-	const trueLabel = "true"
 
-	selector := labels.SelectorFromSet(map[string]string{submarinerGatewayLabel: trueLabel})
+	if gatewayNode.Node == "" {
+		fmt.Printf("no gateway nodes specified, selecting one of the worker node as gateway node")
+		workerNodes, err := GetAllWorkerNodeNames(clientset)
+		if err != nil {
+			return err
+		}
+		gatewayNode.Node = workerNodes[0]
+	}
+	err = addLabelsToNode(clientset, gatewayNode.Node, map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
+	if err != nil {
+		return errors.Wrap(err, "Error labeling the gateway node")
+	}
+	return nil
+}
+
+// GetAllWorkerNodeNames returns all worker nodes
+func GetAllWorkerNodeNames(clientset kubernetes.Interface) ([]string, error) {
+	workerNodes, err := clientset.CoreV1().Nodes().List(
+		context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker"})
+	if err != nil {
+		return nil, errors.Wrap(err, "error listing Nodes")
+	}
+
+	if len(workerNodes.Items) == 0 {
+		// In some deployments (like KIND), worker nodes are not explicitly labelled. So list non-master nodes.
+		workerNodes, err = clientset.CoreV1().Nodes().List(
+			context.TODO(), metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/master"})
+		if err != nil {
+			return nil, errors.Wrap(err, "error listing Nodes")
+		}
+
+		if len(workerNodes.Items) == 0 {
+			return nil, fmt.Errorf("* No worker node found to label as the gateway\n")
+		}
+	}
+
+	allNodeNames := []string{}
+	for i := range workerNodes.Items {
+		allNodeNames = append(allNodeNames, workerNodes.Items[i].GetName())
+	}
+	return allNodeNames, nil
+}
+
+// ListGatewayNodes returns all nodes labelled as gateway
+func ListGatewayNodes(config *rest.Config) (bool, error) {
+	_, clientset, err := restconfig.Clients(config)
+	if err != nil {
+		return false, errors.Wrap(err, "unable to set the Kubernetes cluster connection up")
+	}
+
+	selector := labels.SelectorFromSet(map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
 
 	labeledNodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
 	if err != nil {
-		return errors.Wrap(err, "error listing Nodes")
+		return false, errors.Wrap(err, "error listing Nodes")
 	}
 
 	if len(labeledNodes.Items) > 0 {
@@ -636,73 +619,9 @@ func handleNodeLabels(config *rest.Config) error {
 		for i := range labeledNodes.Items {
 			fmt.Printf("  - %s\n", labeledNodes.Items[i].GetName())
 		}
-	} else {
-		answer, err := askForGatewayNode(clientset)
-		if err != nil {
-			return err
-		}
-
-		if answer.Node == "" {
-			fmt.Printf("* No worker node found to label as the gateway\n")
-		} else {
-			err = addLabelsToNode(clientset, answer.Node, map[string]string{submarinerGatewayLabel: trueLabel})
-			return errors.Wrap(err, "Error labeling the gateway node")
-		}
+		return true, nil
 	}
-
-	return nil
-}
-
-func askForGatewayNode(clientset kubernetes.Interface) (struct{ Node string }, error) {
-	// List the worker nodes and select one
-	workerNodes, err := clientset.CoreV1().Nodes().List(
-		context.TODO(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker"})
-	if err != nil {
-		return struct{ Node string }{}, errors.Wrap(err, "error listing Nodes")
-	}
-
-	if len(workerNodes.Items) == 0 {
-		// In some deployments (like KIND), worker nodes are not explicitly labelled. So list non-master nodes.
-		workerNodes, err = clientset.CoreV1().Nodes().List(
-			context.TODO(), metav1.ListOptions{LabelSelector: "!node-role.kubernetes.io/master"})
-		if err != nil {
-			return struct{ Node string }{}, errors.Wrap(err, "error listing Nodes")
-		}
-
-		if len(workerNodes.Items) == 0 {
-			return struct{ Node string }{}, nil
-		}
-	}
-
-	if len(workerNodes.Items) == 1 {
-		return struct{ Node string }{workerNodes.Items[0].GetName()}, nil
-	}
-
-	allNodeNames := []string{}
-	for i := range workerNodes.Items {
-		allNodeNames = append(allNodeNames, workerNodes.Items[i].GetName())
-	}
-
-	qs := []*survey.Question{
-		{
-			Name: "node",
-			Prompt: &survey.Select{
-				Message: "Which node should be used as the gateway?",
-				Options: allNodeNames,
-			},
-		},
-	}
-
-	answers := struct {
-		Node string
-	}{}
-
-	err = survey.Ask(qs, &answers)
-	if err != nil {
-		return struct{ Node string }{}, err // nolint:wrapcheck // No need to wrap here
-	}
-
-	return answers, nil
+	return false, nil
 }
 
 // this function was sourced from:

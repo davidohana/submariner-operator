@@ -21,12 +21,15 @@ package subctl
 import (
 	"errors"
 	"fmt"
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/spf13/cobra"
 	submariner "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
 	"github.com/submariner-io/submariner-operator/internal/cli"
 	"github.com/submariner-io/submariner-operator/internal/exit"
+	"github.com/submariner-io/submariner-operator/internal/restconfig"
 	"github.com/submariner-io/submariner-operator/pkg/join"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
+	"strings"
 )
 
 var joinFlags join.Options
@@ -44,9 +47,67 @@ var joinCmd = &cobra.Command{
 		exit.OnError("Error loading the broker information from the given file", err)
 		fmt.Printf("* %s says broker is at: %s\n", args[0], subctlData.BrokerURL)
 
-		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer, cli.NewReporter())
-		exit.OnError("error joining cluster", err)
+		if joinFlags.ClusterID == "" {
+			joinFlags.ClusterID, err = askForClusterID()
+			exit.OnError("Error collecting information", err)
+		}
+
+		if joinFlags.ServiceCIDR == "" {
+			joinFlags.ServiceCIDR, err = askForCIDR("Service")
+			exit.OnError("Error detecting Service CIDR", err)
+		}
+
+		if joinFlags.ClusterCIDR == "" {
+			joinFlags.ClusterCIDR, err = askForCIDR("Cluster")
+			exit.OnError("Error detecting Cluster CIDR", err)
+		}
+
+		clientConfig, err := restConfigProducer.ClientConfig().ClientConfig()
+		_, clientset, err := restconfig.Clients(clientConfig)
+		exit.OnError("unable to set the Kubernetes cluster connection up", err)
+
+		gatewayNodesPresent, err := join.ListGatewayNodes(clientConfig)
+		if err != nil {
+			exit.OnError("Error getting gateway node", err)
+		}
+		var gatewayNode struct{Node string}
+		// If not Gateway nodes present, get all worker nodes and ask user to select one of them as gateway node
+		if !gatewayNodesPresent {
+			allWorkerNodeNames, err := join.GetAllWorkerNodeNames(clientset)
+			if err != nil {
+				exit.OnError("error listing worker nodes", err)
+			}
+			gatewayNode, err = askForGatewayNode(allWorkerNodeNames)
+			exit.OnError("Error getting gateway node", err)
+		}
+
+		fmt.Printf("cluster id is %s", joinFlags.ClusterID)
+		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer, cli.NewReporter(), gatewayNode)
+		exit.OnError("Error joining cluster", err)
 	},
+}
+
+func askForGatewayNode(allWorkerNodeNames []string) (struct{ Node string }, error) {
+	qs := []*survey.Question{
+		{
+			Name: "node",
+			Prompt: &survey.Select{
+				Message: "Which node should be used as the gateway?",
+				Options: allWorkerNodeNames,
+			},
+		},
+	}
+
+	answers := struct {
+		Node string
+	}{}
+
+	err := survey.Ask(qs, &answers)
+	if err != nil {
+		return struct{ Node string }{}, err // nolint:wrapcheck // No need to wrap here
+	}
+
+	return answers, nil
 }
 
 func checkArgumentPassed(args []string) error {
@@ -55,6 +116,70 @@ func checkArgumentPassed(args []string) error {
 	}
 
 	return nil
+}
+
+func askForClusterID() (string, error) {
+	// Missing information
+	qs := []*survey.Question{}
+
+	qs = append(qs, &survey.Question{
+		Name:   "clusterID",
+		Prompt: &survey.Input{Message: "What is your cluster ID?"},
+		Validate: func(val interface{}) error {
+			str, ok := val.(string)
+			if !ok {
+				return nil
+			}
+
+			_, err := join.IsValidClusterID(str)
+			fmt.Printf("error is %s", err)
+			return err
+		},
+	})
+
+	answers := struct {
+		ClusterID  string
+	}{}
+
+	err := survey.Ask(qs, &answers)
+	// Most likely a programming error
+	if err != nil {
+		return "", err
+	}
+
+	return answers.ClusterID, nil
+}
+
+func askForCIDR(name string) (string, error) {
+	autodetect := false
+	prompt := &survey.Confirm{
+		Message: fmt.Sprintf("Do you want to autodetect %s CIDR?", name)}
+
+	err := survey.AskOne(prompt, &autodetect)
+	if err != nil {
+		return "", err // nolint:wrapcheck // No need to wrap here
+	}
+
+	if !autodetect {
+		qs := []*survey.Question{{
+			Name:     "cidr",
+			Prompt:   &survey.Input{Message: fmt.Sprintf("What's the %s CIDR for your cluster?", name)},
+			Validate: survey.Required,
+		}}
+
+		answers := struct {
+			Cidr string
+		}{}
+
+		err := survey.Ask(qs, &answers)
+		if err != nil {
+			return "", err // nolint:wrapcheck // No need to wrap here
+		}
+
+		return strings.TrimSpace(answers.Cidr), nil
+	}
+	fmt.Printf("Autodetecting %s CIDR", name)
+	return "", nil
 }
 
 func init() {

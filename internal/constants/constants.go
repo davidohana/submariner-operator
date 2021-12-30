@@ -22,4 +22,6 @@ const (
 	DefaultBrokerNamespace = "submariner-k8s-broker"
 	SubmarinerBrokerAdminSA = "submariner-k8s-broker-admin"
 	SubmarinerNamespace    = "submariner-operator"
+	SubmarinerGatewayLabel = "submariner.io/gateway"
+	TrueLabel = "true"
 )
