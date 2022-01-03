@@ -41,49 +41,48 @@ var joinCmd = &cobra.Command{
 	PreRunE: restConfigProducer.CheckVersionMismatch,
 	Run: func(cmd *cobra.Command, args []string) {
 		err := checkArgumentPassed(args)
-		exit.OnError("Argument missing", err)
+		exit.WithMessage("Argument missing", err)
 
 		subctlData, err := datafile.NewFromFile(args[0])
-		exit.OnError("Error loading the broker information from the given file", err)
+		exit.WithMessage("Error loading the broker information from the given file", err)
 		fmt.Printf("* %s says broker is at: %s\n", args[0], subctlData.BrokerURL)
 
 		if joinFlags.ClusterID == "" {
 			joinFlags.ClusterID, err = askForClusterID()
-			exit.OnError("Error collecting information", err)
+			exit.WithMessage("Error collecting information", err)
 		}
 
 		if joinFlags.ServiceCIDR == "" {
 			joinFlags.ServiceCIDR, err = askForCIDR("Service")
-			exit.OnError("Error detecting Service CIDR", err)
+			exit.WithMessage("Error detecting Service CIDR", err)
 		}
 
 		if joinFlags.ClusterCIDR == "" {
 			joinFlags.ClusterCIDR, err = askForCIDR("Cluster")
-			exit.OnError("Error detecting Cluster CIDR", err)
+			exit.WithMessage("Error detecting Cluster CIDR", err)
 		}
 
 		clientConfig, err := restConfigProducer.ClientConfig().ClientConfig()
 		_, clientset, err := restconfig.Clients(clientConfig)
-		exit.OnError("unable to set the Kubernetes cluster connection up", err)
+		exit.WithMessage("unable to set the Kubernetes cluster connection up", err)
 
 		gatewayNodesPresent, err := join.ListGatewayNodes(clientConfig)
 		if err != nil {
-			exit.OnError("Error getting gateway node", err)
+			exit.WithMessage("Error getting gateway node", err)
 		}
 		var gatewayNode struct{Node string}
 		// If not Gateway nodes present, get all worker nodes and ask user to select one of them as gateway node
 		if !gatewayNodesPresent {
 			allWorkerNodeNames, err := join.GetAllWorkerNodeNames(clientset)
 			if err != nil {
-				exit.OnError("error listing worker nodes", err)
+				exit.WithMessage("error listing worker nodes", err)
 			}
 			gatewayNode, err = askForGatewayNode(allWorkerNodeNames)
-			exit.OnError("Error getting gateway node", err)
+			exit.WithMessage("Error getting gateway node", err)
 		}
 
-		fmt.Printf("cluster id is %s", joinFlags.ClusterID)
 		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer, cli.NewReporter(), gatewayNode)
-		exit.OnError("Error joining cluster", err)
+		exit.WithMessage("Error joining cluster", err)
 	},
 }
 

@@ -29,7 +29,7 @@ import (
 	"github.com/submariner-io/submariner-operator/internal/image"
 	"github.com/submariner-io/submariner-operator/internal/restconfig"
 	"github.com/submariner-io/submariner-operator/pkg/broker"
-	submarinerclientset "github.com/submariner-io/submariner-operator/pkg/client/clientset/versioned"
+	"github.com/submariner-io/submariner-operator/pkg/client"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
@@ -105,13 +105,18 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		return status.Error(err, "Error connecting to the target cluster")
 	}
 
-	err = checkRequirements(jo, clientConfig)
+	clientProducer, err := client.NewProducerFromRestConfig(clientConfig)
+	if err != nil {
+		return status.Error(err, "error creating client producer")
+	}
+
+	err = checkRequirements(jo, clientProducer.ForKubernetes())
 	if err != nil {
 		return status.Error(err, "Error checking Submariner requirements")
 	}
 
 	if subctlData.IsConnectivityEnabled() && jo.LabelGateway {
-		err := handleNodeLabels(clientConfig, gatewayNode)
+		err := handleNodeLabels(clientProducer.ForKubernetes(), gatewayNode)
 		if err != nil {
 			return status.Error(err, "Unable to set the gateway node up")
 		}
@@ -119,7 +124,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 	status.End()
 
 	status.Start("Discovering network details")
-	networkDetails, err := getNetworkDetails(clientConfig, status)
+	networkDetails, err := getNetworkDetails(clientProducer, status)
 	if err != nil {
 		return status.Error(err, "Unable to discover network details")
 	}
@@ -172,7 +177,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		return status.Error(err, "Error overriding Operator Image")
 	}
 
-	err = submarinerop.Ensure(status, clientConfig, constants.OperatorNamespace, operatorImage, jo.OperatorDebug)
+	err = submarinerop.Ensure(status, clientProducer, constants.OperatorNamespace, operatorImage, jo.OperatorDebug)
 	if err != nil {
 		return status.Error(err, "Error deploying the operator")
 	}
@@ -188,7 +193,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 
 	status.Start("Connecting to Broker")
 	// We need to connect to the broker in all cases
-	brokerSecret, err := brokersecret.Ensure(clientConfig, constants.OperatorNamespace, populateBrokerSecret(subctlData))
+	brokerSecret, err := brokersecret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, populateBrokerSecret(subctlData))
 	if err != nil {
 		return status.Error(err, "Error creating broker secret for cluster")
 	}
@@ -201,7 +206,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		if err != nil {
 			return status.Error(err, "Error populating Submariner spec")
 		}
-		err = submarinercr.Ensure(clientConfig, constants.OperatorNamespace, submarinerSpec)
+		err = submarinercr.Ensure(clientProducer.ForOperator(), constants.OperatorNamespace, submarinerSpec)
 		if err == nil {
 			status.Success("Submariner is up and running")
 			status.End()
@@ -215,7 +220,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		if err != nil {
 			return status.Error(err, "Error populating service discovery spec")
 		}
-		err = servicediscoverycr.Ensure(clientConfig, constants.OperatorNamespace, serviceDiscoverySpec)
+		err = servicediscoverycr.Ensure(clientProducer.ForOperator(), constants.OperatorNamespace, serviceDiscoverySpec)
 		if err == nil {
 			status.Success("Service discovery is up and running")
 		} else {
@@ -226,8 +231,8 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 	return nil
 }
 
-func checkRequirements(jo Options, config *rest.Config) error {
-	_, failedRequirements, err := version.CheckRequirements(config)
+func checkRequirements(jo Options, client kubernetes.Interface) error {
+	_, failedRequirements, err := version.CheckRequirements(client)
 	// We display failed requirements even if an error occurred
 	if len(failedRequirements) > 0 {
 		fmt.Println("The target cluster fails to meet Submariner's requirements:")
@@ -299,18 +304,9 @@ func AllocateAndUpdateGlobalCIDRConfigMap(jo Options, brokerAdminClientset *kube
 	return retryErr // nolint:wrapcheck // No need to wrap here
 }
 
-func getNetworkDetails(config *rest.Config, status reporter.Interface) (*network.ClusterNetwork, error) {
-	dynClient, clientSet, err := restconfig.Clients(config)
-	if err != nil {
-		return nil, errors.Wrap(err, "Unable to set the Kubernetes cluster connection up")
-	}
+func getNetworkDetails(clientProducer client.Producer, status reporter.Interface) (*network.ClusterNetwork, error) {
 
-	submarinerClient, err := submarinerclientset.NewForConfig(config)
-	if err != nil {
-		return nil, errors.Wrap(err, "Unable to get the Submariner client")
-	}
-
-	networkDetails, err := network.Discover(dynClient, clientSet, submarinerClient, constants.OperatorNamespace)
+	networkDetails, err := network.Discover(clientProducer.ForDynamic(), clientProducer.ForKubernetes(), clientProducer.ForOperator(), constants.OperatorNamespace)
 	if err != nil {
 		status.Warning(fmt.Sprintf("Error trying to discover network details: %s", err))
 	} else if networkDetails != nil {
@@ -550,11 +546,7 @@ func getCustomCoreDNSParams(jo Options) (namespace, name string) {
 
 
 // labels the specified worker node as a gateway node
-func handleNodeLabels(config *rest.Config, gatewayNode struct{Node string}) error {
-	_, clientset, err := restconfig.Clients(config)
-	if err != nil {
-		return errors.Wrap(err, "unable to set the Kubernetes cluster connection up")
-	}
+func handleNodeLabels(clientset kubernetes.Interface, gatewayNode struct{Node string}) error {
 
 	if gatewayNode.Node == "" {
 		fmt.Printf("no gateway nodes specified, selecting one of the worker node as gateway node")
@@ -564,7 +556,7 @@ func handleNodeLabels(config *rest.Config, gatewayNode struct{Node string}) erro
 		}
 		gatewayNode.Node = workerNodes[0]
 	}
-	err = addLabelsToNode(clientset, gatewayNode.Node, map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
+	err := addLabelsToNode(clientset, gatewayNode.Node, map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
 	if err != nil {
 		return errors.Wrap(err, "Error labeling the gateway node")
 	}
@@ -601,13 +593,12 @@ func GetAllWorkerNodeNames(clientset kubernetes.Interface) ([]string, error) {
 
 // ListGatewayNodes returns all nodes labelled as gateway
 func ListGatewayNodes(config *rest.Config) (bool, error) {
-	_, clientset, err := restconfig.Clients(config)
+	selector := labels.SelectorFromSet(map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
+
+	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return false, errors.Wrap(err, "unable to set the Kubernetes cluster connection up")
 	}
-
-	selector := labels.SelectorFromSet(map[string]string{constants.SubmarinerGatewayLabel: constants.TrueLabel})
-
 	labeledNodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{LabelSelector: selector.String()})
 	if err != nil {
 		return false, errors.Wrap(err, "error listing Nodes")
@@ -626,7 +617,7 @@ func ListGatewayNodes(config *rest.Config) (bool, error) {
 
 // this function was sourced from:
 // https://github.com/kubernetes/kubernetes/blob/a3ccea9d8743f2ff82e41b6c2af6dc2c41dc7b10/test/utils/density_utils.go#L36
-func addLabelsToNode(c kubernetes.Interface, nodeName string, labelsToAdd map[string]string) error {
+func addLabelsToNode(clientset kubernetes.Interface, nodeName string, labelsToAdd map[string]string) error {
 	tokens := make([]string, 0, len(labelsToAdd))
 	for k, v := range labelsToAdd {
 		tokens = append(tokens, fmt.Sprintf("%q:%q", k, v))
@@ -640,7 +631,7 @@ func addLabelsToNode(c kubernetes.Interface, nodeName string, labelsToAdd map[st
 
 	var lastErr error
 	err := wait.ExponentialBackoff(nodeLabelBackoff, func() (bool, error) {
-		_, lastErr = c.CoreV1().Nodes().Patch(context.TODO(), nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+		_, lastErr = clientset.CoreV1().Nodes().Patch(context.TODO(), nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 		if lastErr != nil {
 			if !k8serrors.IsConflict(lastErr) {
 				return false, lastErr // nolint:wrapcheck // No need to wrap here
