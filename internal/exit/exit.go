@@ -34,9 +34,11 @@ func OnError(err error) {
 
 // WithMessage will print the message and quit the program with an error code.
 func WithMessage(message string, err error) {
-	fmt.Fprintln(os.Stderr, message, err)
-	printVersion()
-	os.Exit(1)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, message, err)
+		printVersion()
+		os.Exit(1)
+	}
 }
 
 func printVersion() {

@@ -41,7 +41,7 @@ var joinCmd = &cobra.Command{
 	PreRunE: restConfigProducer.CheckVersionMismatch,
 	Run: func(cmd *cobra.Command, args []string) {
 		err := checkArgumentPassed(args)
-		exit.WithMessage("Argument missing", err)
+		exit.OnError(err)
 
 		subctlData, err := datafile.NewFromFile(args[0])
 		exit.WithMessage("Error loading the broker information from the given file", err)
