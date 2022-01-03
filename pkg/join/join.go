@@ -33,7 +33,6 @@ import (
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
-	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokersecret"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/servicediscoverycr"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinercr"
@@ -83,7 +82,7 @@ type Options struct {
 	CorednsCustomConfigMap        string
 }
 
-func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigProducer restconfig.Producer, status reporter.Interface, gatewayNode struct{Node string}) error {
+func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer restconfig.Producer, status reporter.Interface, gatewayNode struct{Node string}) error {
 
 	status.Start("Trying to join cluster %s", jo.ClusterID)
 	err := determineClusterID(jo, restConfigProducer)
@@ -115,7 +114,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		return status.Error(err, "Error checking Submariner requirements")
 	}
 
-	if subctlData.IsConnectivityEnabled() && jo.LabelGateway {
+	if brokerInfo.IsConnectivityEnabled() && jo.LabelGateway {
 		err := handleNodeLabels(clientProducer.ForKubernetes(), gatewayNode)
 		if err != nil {
 			return status.Error(err, "Unable to set the gateway node up")
@@ -141,7 +140,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 	status.End()
 
 	status.Start("Gathering relevant information from Broker")
-	brokerAdminConfig, err := subctlData.GetBrokerAdministratorConfig()
+	brokerAdminConfig, err := brokerInfo.GetBrokerAdministratorConfig()
 	if err != nil {
 		return status.Error(err, "Error retrieving broker admin config")
 	}
@@ -151,7 +150,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 		return status.Error(err, "Error retrieving broker admin connection")
 	}
 
-	brokerNamespace := string(subctlData.ClientToken.Data["namespace"])
+	brokerNamespace := string(brokerInfo.ClientToken.Data["namespace"])
 	netconfig := globalnet.Config{
 		ClusterID:               jo.ClusterID,
 		GlobalnetCIDR:           jo.GlobalnetCIDR,
@@ -185,7 +184,7 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 
 	status.Start("Creating SA for cluster")
 
-	subctlData.ClientToken, err = broker.CreateSAForCluster(brokerAdminClientset, jo.ClusterID, brokerNamespace)
+	brokerInfo.ClientToken, err = broker.CreateSAForCluster(brokerAdminClientset, jo.ClusterID, brokerNamespace)
 	if err != nil {
 		return status.Error(err, "Error creating SA for cluster")
 	}
@@ -193,16 +192,16 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 
 	status.Start("Connecting to Broker")
 	// We need to connect to the broker in all cases
-	brokerSecret, err := brokersecret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, populateBrokerSecret(subctlData))
+	brokerSecret, err := brokersecret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, populateBrokerSecret(brokerInfo))
 	if err != nil {
 		return status.Error(err, "Error creating broker secret for cluster")
 	}
 	status.End()
 
-	if subctlData.IsConnectivityEnabled() {
+	if brokerInfo.IsConnectivityEnabled() {
 		status.Start("Deploying Submariner")
 
-		submarinerSpec, err := populateSubmarinerSpec(jo, subctlData, brokerSecret, netconfig)
+		submarinerSpec, err := populateSubmarinerSpec(jo, brokerInfo, brokerSecret, netconfig)
 		if err != nil {
 			return status.Error(err, "Error populating Submariner spec")
 		}
@@ -214,9 +213,9 @@ func SubmarinerCluster(subctlData *datafile.SubctlData, jo Options, restConfigPr
 			return status.Error(err, "Submariner deployment failed")
 		}
 
-	} else if subctlData.IsServiceDiscoveryEnabled() {
+	} else if brokerInfo.IsServiceDiscoveryEnabled() {
 		status.Start("Deploying service discovery only")
-		serviceDiscoverySpec, err := populateServiceDiscoverySpec(jo, subctlData, brokerSecret)
+		serviceDiscoverySpec, err := populateServiceDiscoverySpec(jo, brokerInfo, brokerSecret)
 		if err != nil {
 			return status.Error(err, "Error populating service discovery spec")
 		}
@@ -361,20 +360,20 @@ func IsValidClusterID(clusterID string) (bool, error) {
 	return true, nil
 }
 
-func populateBrokerSecret(subctlData *datafile.SubctlData) *v1.Secret {
+func populateBrokerSecret(brokerInfo broker.Info) *v1.Secret {
 	// We need to copy the broker token secret as an opaque secret to store it in the connecting cluster
 	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "broker-secret-",
 		},
 		Type: v1.SecretTypeOpaque,
-		Data: subctlData.ClientToken.Data,
+		Data: brokerInfo.ClientToken.Data,
 	}
 }
 
-func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerSecret *v1.Secret,
+func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret,
 	netconfig globalnet.Config) (*submariner.SubmarinerSpec, error) {
-	brokerURL := subctlData.BrokerURL
+	brokerURL := brokerInfo.BrokerURL
 	if idx := strings.Index(brokerURL, "://"); idx >= 0 {
 		// Submariner doesn't work with a schema prefix
 		brokerURL = brokerURL[(idx + 3):]
@@ -392,8 +391,8 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 		crClusterCIDR = netconfig.ClusterCIDR
 	}
 
-	if jo.CustomDomains == nil && subctlData.CustomDomains != nil {
-		jo.CustomDomains = *subctlData.CustomDomains
+	if jo.CustomDomains == nil && brokerInfo.CustomDomains != nil {
+		jo.CustomDomains = *brokerInfo.CustomDomains
 	}
 
 	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
@@ -411,7 +410,7 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 		CeIPSecDebug:             jo.IpsecDebug,
 		CeIPSecForceUDPEncaps:    jo.ForceUDPEncaps,
 		CeIPSecPreferredServer:   jo.PreferredServer,
-		CeIPSecPSK:               base64.StdEncoding.EncodeToString(subctlData.IPSecPSK.Data["psk"]),
+		CeIPSecPSK:               base64.StdEncoding.EncodeToString(brokerInfo.IPSecPSK.Data["psk"]),
 		BrokerK8sCA:              base64.StdEncoding.EncodeToString(brokerSecret.Data["ca.crt"]),
 		BrokerK8sRemoteNamespace: string(brokerSecret.Data["namespace"]),
 		BrokerK8sApiServerToken:  string(brokerSecret.Data["token"]),
@@ -426,7 +425,7 @@ func populateSubmarinerSpec(jo Options, subctlData *datafile.SubctlData, brokerS
 		ClusterCIDR:              crClusterCIDR,
 		Namespace:                constants.SubmarinerNamespace,
 		CableDriver:              jo.CableDriver,
-		ServiceDiscoveryEnabled:  subctlData.IsServiceDiscoveryEnabled(),
+		ServiceDiscoveryEnabled:  brokerInfo.IsServiceDiscoveryEnabled(),
 		ImageOverrides:           imageOverrides,
 		LoadBalancerEnabled:      jo.LoadBalancerEnabled,
 		ConnectionHealthCheck: &submariner.HealthCheckSpec{
@@ -481,11 +480,11 @@ func removeSchemaPrefix(brokerURL string) string {
 	return brokerURL
 }
 
-func populateServiceDiscoverySpec(jo Options, subctlData *datafile.SubctlData, brokerSecret *v1.Secret) (*submariner.ServiceDiscoverySpec, error) {
-	brokerURL := removeSchemaPrefix(subctlData.BrokerURL)
+func populateServiceDiscoverySpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret) (*submariner.ServiceDiscoverySpec, error) {
+	brokerURL := removeSchemaPrefix(brokerInfo.BrokerURL)
 
-	if jo.CustomDomains == nil && subctlData.CustomDomains != nil {
-		jo.CustomDomains = *subctlData.CustomDomains
+	if jo.CustomDomains == nil && brokerInfo.CustomDomains != nil {
+		jo.CustomDomains = *brokerInfo.CustomDomains
 	}
 
 	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)

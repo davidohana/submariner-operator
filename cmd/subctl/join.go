@@ -27,6 +27,7 @@ import (
 	"github.com/submariner-io/submariner-operator/internal/cli"
 	"github.com/submariner-io/submariner-operator/internal/exit"
 	"github.com/submariner-io/submariner-operator/internal/restconfig"
+	"github.com/submariner-io/submariner-operator/pkg/broker"
 	"github.com/submariner-io/submariner-operator/pkg/join"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/datafile"
 	"strings"
@@ -81,7 +82,9 @@ var joinCmd = &cobra.Command{
 			exit.WithMessage("Error getting gateway node", err)
 		}
 
-		err = join.SubmarinerCluster(subctlData, joinFlags, restConfigProducer, cli.NewReporter(), gatewayNode)
+		brokerInfo, err := broker.ReadInfoFromFile(broker.InfoFileName)
+
+		err = join.SubmarinerCluster(*brokerInfo, joinFlags, restConfigProducer, cli.NewReporter(), gatewayNode)
 		exit.WithMessage("Error joining cluster", err)
 	},
 }
