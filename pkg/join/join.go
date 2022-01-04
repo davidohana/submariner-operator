@@ -30,13 +30,13 @@ import (
 	"github.com/submariner-io/submariner-operator/internal/restconfig"
 	"github.com/submariner-io/submariner-operator/pkg/broker"
 	"github.com/submariner-io/submariner-operator/pkg/client"
+	"github.com/submariner-io/submariner-operator/pkg/deploy"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokersecret"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/servicediscoverycr"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinercr"
-	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinerop"
 	"github.com/submariner-io/submariner-operator/pkg/version"
 	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -109,9 +109,11 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 		return status.Error(err, "error creating client producer")
 	}
 
-	err = checkRequirements(jo, clientProducer.ForKubernetes())
-	if err != nil {
-		return status.Error(err, "Error checking Submariner requirements")
+	if !jo.IgnoreRequirements {
+		err = checkRequirements(jo, clientProducer.ForKubernetes())
+		if err != nil {
+			return status.Error(err, "Error checking Submariner requirements")
+		}
 	}
 
 	if brokerInfo.IsConnectivityEnabled() && jo.LabelGateway {
@@ -170,13 +172,7 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 	status.End()
 
 	status.Start("Deploying the Submariner operator")
-
-	operatorImage, err := image.ForOperator(jo.ImageVersion, jo.Repository, jo.ImageOverrideArr)
-	if err != nil {
-		return status.Error(err, "Error overriding Operator Image")
-	}
-
-	err = submarinerop.Ensure(status, clientProducer, constants.OperatorNamespace, operatorImage, jo.OperatorDebug)
+	err = deploy.Operator(status, jo.ImageVersion, jo.Repository, jo.ImageOverrideArr, jo.OperatorDebug, clientProducer)
 	if err != nil {
 		return status.Error(err, "Error deploying the operator")
 	}
@@ -198,10 +194,15 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 	}
 	status.End()
 
+	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
+	if err != nil {
+		return fmt.Errorf("error overriding Operator image %s", err)
+	}
+
 	if brokerInfo.IsConnectivityEnabled() {
 		status.Start("Deploying Submariner")
 
-		submarinerSpec, err := populateSubmarinerSpec(jo, brokerInfo, brokerSecret, netconfig)
+		submarinerSpec, err := populateSubmarinerSpec(jo, brokerInfo, brokerSecret, netconfig, imageOverrides)
 		if err != nil {
 			return status.Error(err, "Error populating Submariner spec")
 		}
@@ -215,7 +216,7 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 
 	} else if brokerInfo.IsServiceDiscoveryEnabled() {
 		status.Start("Deploying service discovery only")
-		serviceDiscoverySpec, err := populateServiceDiscoverySpec(jo, brokerInfo, brokerSecret)
+		serviceDiscoverySpec, err := populateServiceDiscoverySpec(jo, brokerInfo, brokerSecret, imageOverrides)
 		if err != nil {
 			return status.Error(err, "Error populating service discovery spec")
 		}
@@ -239,10 +240,7 @@ func checkRequirements(jo Options, client kubernetes.Interface) error {
 		for i := range failedRequirements {
 			fmt.Printf("* %s\n", (failedRequirements)[i])
 		}
-
-		if !jo.IgnoreRequirements {
-			return err
-		}
+		return err
 	}
 
 	if err != nil {
@@ -372,12 +370,8 @@ func populateBrokerSecret(brokerInfo broker.Info) *v1.Secret {
 }
 
 func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret,
-	netconfig globalnet.Config) (*submariner.SubmarinerSpec, error) {
-	brokerURL := brokerInfo.BrokerURL
-	if idx := strings.Index(brokerURL, "://"); idx >= 0 {
-		// Submariner doesn't work with a schema prefix
-		brokerURL = brokerURL[(idx + 3):]
-	}
+	netconfig globalnet.Config, imageOverrides map[string]string) (*submariner.SubmarinerSpec, error) {
+	brokerURL := removeSchemaPrefix(brokerInfo.BrokerURL)
 
 	// if our network discovery code was capable of discovering those CIDRs
 	// we don't need to explicitly set it in the operator
@@ -393,11 +387,6 @@ func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1
 
 	if jo.CustomDomains == nil && brokerInfo.CustomDomains != nil {
 		jo.CustomDomains = *brokerInfo.CustomDomains
-	}
-
-	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
-	if err != nil {
-		return nil, fmt.Errorf("error overriding Operator image %s", err)
 	}
 
 	// For backwards compatibility, the connection information is populated through the secret and individual components
@@ -476,20 +465,14 @@ func removeSchemaPrefix(brokerURL string) string {
 		// Submariner doesn't work with a schema prefix
 		brokerURL = brokerURL[(idx + 3):]
 	}
-
 	return brokerURL
 }
 
-func populateServiceDiscoverySpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret) (*submariner.ServiceDiscoverySpec, error) {
+func populateServiceDiscoverySpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret, imageOverrides map[string]string) (*submariner.ServiceDiscoverySpec, error) {
 	brokerURL := removeSchemaPrefix(brokerInfo.BrokerURL)
 
 	if jo.CustomDomains == nil && brokerInfo.CustomDomains != nil {
 		jo.CustomDomains = *brokerInfo.CustomDomains
-	}
-
-	imageOverrides, err := image.GetOverrides(jo.ImageOverrideArr)
-	if err != nil {
-		return nil, fmt.Errorf("error overriding Operator image %s", err)
 	}
 
 	serviceDiscoverySpec := submariner.ServiceDiscoverySpec{
@@ -542,7 +525,6 @@ func getCustomCoreDNSParams(jo Options) (namespace, name string) {
 
 	return namespace, name
 }
-
 
 // labels the specified worker node as a gateway node
 func handleNodeLabels(clientset kubernetes.Interface, gatewayNode struct{Node string}) error {

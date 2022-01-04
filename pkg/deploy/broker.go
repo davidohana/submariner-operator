@@ -24,14 +24,11 @@ import (
 	"github.com/submariner-io/admiral/pkg/stringset"
 	submarinerv1a1 "github.com/submariner-io/submariner-operator/api/submariner/v1alpha1"
 	"github.com/submariner-io/submariner-operator/internal/component"
-	"github.com/submariner-io/submariner-operator/internal/constants"
-	"github.com/submariner-io/submariner-operator/internal/image"
 	"github.com/submariner-io/submariner-operator/pkg/broker"
 	"github.com/submariner-io/submariner-operator/pkg/client"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokercr"
-	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinerop"
 	crdutils "github.com/submariner-io/submariner-operator/pkg/utils/crds"
 	v1 "k8s.io/api/core/v1"
 )
@@ -93,17 +90,10 @@ func deploy(options *BrokerOptions, status reporter.Interface, clientProducer cl
 	status.End()
 
 	status.Start("Deploying the Submariner operator")
-
-	operatorImage, err := image.ForOperator(options.ImageVersion, options.Repository, nil)
-	if err != nil {
-		return status.Error(err, "error getting Operator image")
-	}
-
-	err = submarinerop.Ensure(status, clientProducer, constants.OperatorNamespace, operatorImage, options.OperatorDebug)
+	err = Operator(status, options.ImageVersion, options.Repository, nil, options.OperatorDebug, clientProducer)
 	if err != nil {
 		return status.Error(err, "error deploying Submariner operator")
 	}
-
 	status.End()
 
 	status.Start("Deploying the broker")
