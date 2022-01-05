@@ -34,7 +34,7 @@ import (
 	"github.com/submariner-io/submariner-operator/pkg/discovery/globalnet"
 	"github.com/submariner-io/submariner-operator/pkg/discovery/network"
 	"github.com/submariner-io/submariner-operator/pkg/reporter"
-	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/brokersecret"
+	"github.com/submariner-io/submariner-operator/pkg/secret"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/servicediscoverycr"
 	"github.com/submariner-io/submariner-operator/pkg/subctl/operator/submarinercr"
 	"github.com/submariner-io/submariner-operator/pkg/version"
@@ -188,7 +188,7 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 
 	status.Start("Connecting to Broker")
 	// We need to connect to the broker in all cases
-	brokerSecret, err := brokersecret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, populateBrokerSecret(brokerInfo))
+	brokerSecret, err := secret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, populateBrokerSecret(brokerInfo))
 	if err != nil {
 		return status.Error(err, "Error creating broker secret for cluster")
 	}
@@ -202,7 +202,12 @@ func SubmarinerCluster(brokerInfo broker.Info, jo Options, restConfigProducer re
 	if brokerInfo.IsConnectivityEnabled() {
 		status.Start("Deploying Submariner")
 
-		submarinerSpec, err := populateSubmarinerSpec(jo, brokerInfo, brokerSecret, netconfig, imageOverrides)
+		pskSecret, err := secret.Ensure(clientProducer.ForKubernetes(), constants.OperatorNamespace, brokerInfo.IPSecPSK)
+		if err != nil {
+			return status.Error(err, "Error creating PSK secret for cluster")
+		}
+
+		submarinerSpec, err := populateSubmarinerSpec(jo, brokerInfo, brokerSecret, pskSecret, netconfig, imageOverrides)
 		if err != nil {
 			return status.Error(err, "Error populating Submariner spec")
 		}
@@ -369,7 +374,7 @@ func populateBrokerSecret(brokerInfo broker.Info) *v1.Secret {
 	}
 }
 
-func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret,
+func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1.Secret, pskSecret *v1.Secret,
 	netconfig globalnet.Config, imageOverrides map[string]string) (*submariner.SubmarinerSpec, error) {
 	brokerURL := removeSchemaPrefix(brokerInfo.BrokerURL)
 
@@ -400,6 +405,7 @@ func populateSubmarinerSpec(jo Options, brokerInfo broker.Info, brokerSecret *v1
 		CeIPSecForceUDPEncaps:    jo.ForceUDPEncaps,
 		CeIPSecPreferredServer:   jo.PreferredServer,
 		CeIPSecPSK:               base64.StdEncoding.EncodeToString(brokerInfo.IPSecPSK.Data["psk"]),
+		CeIPSecPSKSecret:         pskSecret.ObjectMeta.Name,
 		BrokerK8sCA:              base64.StdEncoding.EncodeToString(brokerSecret.Data["ca.crt"]),
 		BrokerK8sRemoteNamespace: string(brokerSecret.Data["namespace"]),
 		BrokerK8sApiServerToken:  string(brokerSecret.Data["token"]),
